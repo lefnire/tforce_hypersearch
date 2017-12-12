@@ -1,3 +1,22 @@
+"""
+Uses Bayesian Optimization to search hyperparamter space for best-performing TensorForce model.
+
+Each hyper is specified as `key: {type, vals, requires, hook}`.
+- type: (int|bounded|bool). bool is True|False param, bounded is a float between min & max, int is "choose one"
+    eg 'activation' one of (tanh|elu|selu|..)`)
+- vals: the vals this hyper can take on. If type(vals) is primitive, hard-coded at this value. If type is list, then
+    (a) min/max specified inside (for bounded); (b) all possible options (for 'int'). If type is dict, then the keys
+    are used in the searching (eg, look at the network hyper) and the values are used as the configuration.
+- guess: initial guess (supplied by human) to explore
+- pre/post/hydrate (hooks): transform this hyper before plugging it into Configuration(). Eg, we'd use type='bounded'
+    for batch size since we want to range from min to max (instead of listing all possible values); but we'd cast it
+    to an int inside hook before using it. (Actually we clamp it to blocks of 8, as you'll see).
+
+The special sauce is specifying hypers as dot-separated keys, like `memory.type`. This allows us to easily
+mix-and-match even within a config-dict. Eg, you can try different combos of hypers within `memory{}` w/o having to
+specify the whole block combo (`memory=({this1,that1}, {this2,that2})`). To use this properly, make sure to specify
+a `requires` field where necessary.
+"""
 import argparse, json, math, time, pdb
 from pprint import pprint
 from box import Box
@@ -15,24 +34,6 @@ from tensorforce.contrib.openai_gym import OpenAIGym
 
 import data
 
-"""
-Each hyper is specified as `key: {type, vals, requires, hook}`.
-- type: (int|bounded|bool). bool is True|False param, bounded is a float between min & max, int is "choose one"
-    eg 'activation' one of (tanh|elu|selu|..)`)
-- vals: the vals this hyper can take on. If type(vals) is primitive, hard-coded at this value. If type is list, then
-    (a) min/max specified inside (for bounded); (b) all possible options (for 'int'). If type is dict, then the keys
-    are used in the searching (eg, look at the network hyper) and the values are used as the configuration.
-- guess: initial guess (supplied by human) to explore
-- pre/post/hydrate (hooks): transform this hyper before plugging it into Configuration(). Eg, we'd use type='bounded'
-    for batch size since we want to range from min to max (instead of listing all possible values); but we'd cast it
-    to an int inside hook before using it. (Actually we clamp it to blocks of 8, as you'll see).
-
-The special sauce is specifying hypers as dot-separated keys, like `memory.type`. This allows us to easily
-mix-and-match even within a config-dict. Eg, you can try different combos of hypers within `memory{}` w/o having to
-specify the whole block combo (`memory=({this1,that1}, {this2,that2})`). To use this properly, make sure to specify
-a `requires` field where necessary.
-"""
-
 
 def build_net_spec(hypers, baseline=False):
     """Builds a net_spec from some specifications like width, depth, etc"""
@@ -40,17 +41,21 @@ def build_net_spec(hypers, baseline=False):
 
     dense = {'type': 'dense', 'activation': net.activation, 'l2_regularization': net.l2, 'l1_regularization': net.l1}
     dropout = {'type': 'dropout', 'rate': net.dropout}
-    conv2d = {'type': 'conv2d', 'bias': True, 'l2_regularization': net.l2, 'l1_regularization': net.l1}  # TODO bias as hyper?
+    conv2d = {'type': 'conv2d', 'bias': True, 'l2_regularization': net.l2,
+              'l1_regularization': net.l1}  # TODO bias as hyper?
     lstm = {'type': 'internal_lstm', 'dropout': net.dropout}
+
+    # For LSTM baselines, we don't want the LSTM cells nor the pre-layer
     lstm_baseline = net.type == 'lstm' and baseline
 
     arr = []
-    if net.dropout: arr.append({**dropout})
+    if net.dropout:
+        arr.append({**dropout})
 
     # Pre-layer
     if 'pre_depth' in net and not lstm_baseline:
         for i in range(net.pre_depth):
-            size = int(net.width/(net.pre_depth-i+1)) if net.funnel else net.width
+            size = int(net.width / (net.pre_depth - i + 1)) if net.funnel else net.width
             arr.append({'size': size, **dense})
             if net.dropout: arr.append({**dropout})
 
@@ -58,8 +63,10 @@ def build_net_spec(hypers, baseline=False):
     if not lstm_baseline:
         for i in range(net.depth):
             if net.type == 'conv2d':
-                size = max([32, int(net.width/4)])
-                if i == 0: size = int(size/2) # FIXME most convs have their first layer smaller... right? just the first, or what?
+                size = max([32, int(net.width / 4)])
+                # FIXME most convs have their first layer smaller... right? just the first, or what?
+                if i == 0:
+                    size = int(size / 2)
                 arr.append({'size': size, 'window': net.window, 'stride': net.stride, **conv2d})
             else:
                 # arr.append({'size': net.width, 'return_final_state': (i == net.depth-1), **lstm})
@@ -76,7 +83,10 @@ def build_net_spec(hypers, baseline=False):
     return arr
 
 
-def bins_of_8(x): return int(x // 8) * 8
+def bins_of_8(x):
+    """Converts an int/float to 8-bin chunks (32, 64, etc)"""
+    return int(x // 8) * 8
+
 
 hypers = {}
 hypers['agent'] = {}
@@ -234,17 +244,20 @@ hypers['conv2d'] = {
     },
 }
 
-
 # Fill in implicit 'vals' (eg, 'bool' with [True, False])
 for _, section in hypers.items():
     for k, v in section.items():
-        if type(v) != dict: continue  # hard-coded vals
-        if v['type'] == 'bool': v['vals'] = [0, 1]
+        if type(v) != dict:
+            continue  # hard-coded vals
+        if v['type'] == 'bool':
+            v['vals'] = [0, 1]
+
 
 class DotDict(object):
     """
     Utility class that lets you get/set attributes with a dot-seperated string key, like `d = a['b.c.d']` or `a['b.c.d'] = 1`
     """
+
     def __init__(self, obj):
         self._data = obj
         self.update = self._data.update
@@ -282,6 +295,7 @@ class HSearchEnv(object):
     That's one run: make inner-env, run 300, avg reward, return that. The next episode will be a new set of
     hyperparameters (actions); run inner-env from scratch using new hypers.
     """
+
     def __init__(self, agent='ppo_agent', gpu_split=1, net_type='lstm'):
         """
         TODO only tested with ppo_agent. There's some code for dqn_agent, but I haven't tested. Nothing else
@@ -317,8 +331,10 @@ class HSearchEnv(object):
         self.flat = flat = {}
         # Preprocess hypers
         for k, v in actions.items():
-            try: v = v.item()  # sometimes primitive, sometimes numpy
-            except Exception: pass
+            try:
+                v = v.item()  # sometimes primitive, sometimes numpy
+            except Exception:
+                pass
             hyper = self.hypers[k]
             if 'pre' in hyper:
                 v = hyper['pre'](v)
@@ -335,8 +351,10 @@ class HSearchEnv(object):
         main, custom = DotDict({}), DotDict({})
         for k, v in flat.items():
             obj = main if k in hypers[self.agent] else custom
-            try: obj.update(self.hypers[k]['hydrate'](v, self.flat))
-            except: obj[k] = v
+            try:
+                obj.update(self.hypers[k]['hydrate'](v, self.flat))
+            except:
+                obj[k] = v
         main, custom = main.to_dict(), custom.to_dict()
 
         network = build_net_spec(custom)
@@ -373,7 +391,7 @@ class HSearchEnv(object):
         n_train, n_test = 250, 30
         runner = Runner(agent=agent, environment=env)
         runner.run(episodes=n_train)  # train
-        runner.run(episodes=n_test, deterministic=True) # test
+        runner.run(episodes=n_test, deterministic=True)  # test
         # You may need to remove runner.py's close() calls so you have access to runner.episode_rewards, see
         # https://github.com/lefnire/tensorforce/commit/976405729abd7510d375d6aa49659f91e2d30a07
 
@@ -383,8 +401,8 @@ class HSearchEnv(object):
         print(flat, f"\nReward={reward}\n\n")
 
         sql = """
-          insert into runs (hypers, reward_avg, rewards, agent, flag)
-          values (:hypers, :reward_avg, :rewards, :agent, :flag)
+          INSERT INTO runs (hypers, reward_avg, rewards, agent, flag)
+          VALUES (:hypers, :reward_avg, :rewards, :agent, :flag)
         """
         try:
             self.conn.execute(
@@ -403,13 +421,13 @@ class HSearchEnv(object):
 
     def get_winner(self, from_db=True):
         if from_db:
-            sql = "select id, hypers from runs where agent=:agent order by reward_avg desc limit 1"
+            sql = "SELECT id, hypers FROM runs WHERE agent=:agent ORDER BY reward_avg DESC LIMIT 1"
             winner = self.conn.execute(text(sql), agent=self.agent).fetchone()
             print(f'Using winner {winner.id}')
             winner = winner.hypers
         else:
             winner = {}
-            for k,v in self.hypers.items():
+            for k, v in self.hypers.items():
                 if k not in self.hardcoded:
                     winner[k] = v['guess']
             winner.update(self.hardcoded)
@@ -439,10 +457,13 @@ def main_gp():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-a', '--agent', type=str, default='ppo_agent', help="Agent to use (ppo_agent|dqn_agent|etc)")
-    parser.add_argument('-g', '--gpu_split', type=float, default=1, help="Num ways we'll split the GPU (how many tabs you running?)")
+    parser.add_argument('-g', '--gpu_split', type=float, default=1,
+                        help="Num ways we'll split the GPU (how many tabs you running?)")
     parser.add_argument('-n', '--net_type', type=str, default='lstm', help="(lstm|conv2d) Which network arch to use")
-    parser.add_argument('--guess', action="store_true", default=False, help="Run the hard-coded 'guess' values first before exploring")
-    parser.add_argument('--gpyopt', action="store_true", default=False, help="Use GPyOpt library, or use basic sklearn GP implementation? GpyOpt shows more promise, but has bugs.")
+    parser.add_argument('--guess', action="store_true", default=False,
+                        help="Run the hard-coded 'guess' values first before exploring")
+    parser.add_argument('--gpyopt', action="store_true", default=False,
+                        help="Use GPyOpt library, or use basic sklearn GP implementation? GpyOpt shows more promise, but has bugs.")
     args = parser.parse_args()
 
     # Encode features
@@ -460,7 +481,7 @@ def main_gp():
     mat = pd.DataFrame([empty_obj.copy() for _ in range(max_num_vals)])
     for k, hyper in hypers_.items():
         for i, v in enumerate(hyper['vals']):
-            mat.loc[i,k] = v
+            mat.loc[i, k] = v
     mat.ffill(inplace=True)
 
     # Above is Pandas-friendly stuff, now convert to sklearn-friendly & pipe through OneHotEncoder
@@ -486,8 +507,10 @@ def main_gp():
         h = dict()
         for k, v in obj.items():
             if k in hardcoded: continue
-            if type(v) == bool: h[k] = float(v)
-            else: h[k] = v or 0.
+            if type(v) == bool:
+                h[k] = float(v)
+            else:
+                h[k] = v or 0.
         return vectorizer.transform(h).toarray()[0]
 
     def vec2hypers(vec):
@@ -525,7 +548,7 @@ def main_gp():
 
     while True:
         conn = data.engine.connect()
-        sql = "select hypers, reward_avg from runs where flag=:f"
+        sql = "SELECT hypers, reward_avg FROM runs WHERE flag=:f"
         runs = conn.execute(text(sql), f=args.net_type).fetchall()
         conn.close()
         X, Y = [], []
@@ -561,6 +584,7 @@ def main_gp():
                 x_list=X,
                 y_list=Y
             )
+
 
 if __name__ == '__main__':
     main_gp()

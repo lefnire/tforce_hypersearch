@@ -8,13 +8,13 @@ engine = create_engine("postgres://lefnire:lefnire@127.0.0.1/hypersearch")
 def setup_runs_table():
     conn = engine.connect()
     conn.execute("""
-        create table if not exists runs
+        CREATE TABLE IF NOT EXISTS runs
         (
-            id serial not null,
-            hypers jsonb not null,
-            reward_avg double precision not null,
-            flag varchar(16),
-            rewards double precision[],
-            agent varchar(64) default 'ppo_agent'::character varying not null
+            id SERIAL NOT NULL,
+            hypers JSONB NOT NULL,
+            reward_avg DOUBLE PRECISION NOT NULL,
+            flag VARCHAR(16),
+            rewards DOUBLE PRECISION[],
+            agent VARCHAR(64) DEFAULT 'ppo_agent'::CHARACTER VARYING NOT NULL
         );
     """)
